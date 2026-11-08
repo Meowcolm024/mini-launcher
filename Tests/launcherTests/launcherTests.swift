@@ -93,8 +93,8 @@ private func app(_ name: String) -> AppItem {
     let items = scanApps(in: [applications.path, homeApplications.path], fileManager: fm)
 
     #expect(items.filter { $0.name == "Foo" }.count == 2)
-    #expect(items.contains { $0.id.standardizedFileURL == systemFoo.standardizedFileURL })
-    #expect(items.contains { $0.id.standardizedFileURL == homeFoo.standardizedFileURL })
+    #expect(items.contains { $0.id.standardizedFileURL.path == systemFoo.standardizedFileURL.path })
+    #expect(items.contains { $0.id.standardizedFileURL.path == homeFoo.standardizedFileURL.path })
     #expect(items.contains { $0.name == "Bar" })
     #expect(!items.contains { $0.name == "Contained" })
 }
@@ -143,7 +143,35 @@ private func app(_ name: String) -> AppItem {
     let items = scanApps(in: [applications.path], fileManager: fm)
 
     #expect(items.contains { $0.name == "Safari" })
-    #expect(items.contains { $0.id.standardizedFileURL == link.standardizedFileURL })
+    #expect(items.contains { $0.id.standardizedFileURL.path == link.standardizedFileURL.path })
     #expect(!items.contains { $0.name == "Contained" })
-    #expect(!items.contains { $0.id.standardizedFileURL == realApp.standardizedFileURL })
+    #expect(!items.contains { $0.id.standardizedFileURL.path == realApp.standardizedFileURL.path })
+}
+
+@Test func scanAppsRecursesThroughSymlinkedDirectoriesButNotAppBundles() throws {
+    let fm = FileManager.default
+    let root = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? fm.removeItem(at: root) }
+
+    let applications = root.appendingPathComponent("Applications", isDirectory: true)
+    let realDir = root.appendingPathComponent("RealDir", isDirectory: true)
+    let nestedApp = realDir.appendingPathComponent("Foo.app", isDirectory: true)
+    let nestedInsideApp = nestedApp.appendingPathComponent("Contained.app", isDirectory: true)
+    let dirLink = applications.appendingPathComponent("Extra")
+    let appLinkTarget = root.appendingPathComponent("RealBar.app", isDirectory: true)
+    let appLink = applications.appendingPathComponent("Bar.app")
+
+    try fm.createDirectory(at: applications, withIntermediateDirectories: true)
+    try fm.createDirectory(at: nestedInsideApp, withIntermediateDirectories: true)
+    try fm.createDirectory(at: appLinkTarget, withIntermediateDirectories: true)
+    try fm.createSymbolicLink(at: dirLink, withDestinationURL: realDir)
+    try fm.createSymbolicLink(at: appLink, withDestinationURL: appLinkTarget)
+
+    let items = scanApps(in: [applications.path], fileManager: fm)
+    let logicalFoo = dirLink.appendingPathComponent("Foo.app").standardizedFileURL
+
+    #expect(items.contains { $0.id.standardizedFileURL.path == logicalFoo.path })
+    #expect(items.contains { $0.id.standardizedFileURL.path == appLink.standardizedFileURL.path })
+    #expect(!items.contains { $0.name == "Contained" })
+    #expect(!items.contains { $0.id.standardizedFileURL.path == nestedApp.standardizedFileURL.path })
 }

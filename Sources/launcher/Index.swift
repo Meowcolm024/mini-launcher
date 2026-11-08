@@ -25,43 +25,83 @@ func duplicateAppNames(in apps: [AppItem]) -> Set<String> {
     return Set(counts.compactMap { $0.value > 1 ? $0.key : nil })
 }
 
+private func isAppPath(_ url: URL) -> Bool {
+    url.pathExtension.caseInsensitiveCompare("app") == .orderedSame
+}
+
 func scanApps(in dirs: [String], fileManager: FileManager = .default) -> [AppItem] {
-    var seen = Set<URL>()
+    var seenApps = Set<URL>()
     var items: [AppItem] = []
+
+    func record(_ logicalURL: URL) {
+        // Path-based file URLs avoid /var vs /private/var inequality from mixed URL sources.
+        let id = URL(fileURLWithPath: logicalURL.standardizedFileURL.path)
+        guard seenApps.insert(id).inserted else { return }
+        items.append(
+            AppItem(id: id, name: id.deletingPathExtension().lastPathComponent)
+        )
+    }
+
+    /// `logical` is the path shown/launched; `physical` is where we list (symlinks resolved).
+    /// `stack` tracks physical dirs on the current walk to break symlink cycles.
+    func walk(logical: URL, physical: URL, stack: Set<URL>) {
+        let dirKey = physical.standardizedFileURL
+        guard !stack.contains(dirKey) else { return }
+        var nextStack = stack
+        nextStack.insert(dirKey)
+
+        let keys: Set<URLResourceKey> = [
+            .isHiddenKey, .isSymbolicLinkKey, .isDirectoryKey, .isPackageKey,
+        ]
+        guard
+            let children = try? fileManager.contentsOfDirectory(
+                at: physical,
+                includingPropertiesForKeys: Array(keys),
+                options: []
+            )
+        else { return }
+
+        for child in children {
+            let logicalChild = logical.appendingPathComponent(child.lastPathComponent)
+            let values = try? child.resourceValues(forKeys: keys)
+
+            // Index .app bundles and symlinks named *.app; never descend into them.
+            if isAppPath(logicalChild) || isAppPath(child) {
+                record(logicalChild)
+                continue
+            }
+
+            // Symlinks to system apps are often hidden; still skip other hidden entries.
+            if values?.isHidden == true { continue }
+
+            if values?.isSymbolicLink == true {
+                let resolved = child.resolvingSymlinksInPath().standardizedFileURL
+                var isDir: ObjCBool = false
+                guard fileManager.fileExists(atPath: resolved.path, isDirectory: &isDir),
+                    isDir.boolValue
+                else { continue }
+                // Follow directory symlinks only when the target is not an app bundle.
+                if isAppPath(resolved) { continue }
+                walk(logical: logicalChild, physical: resolved, stack: nextStack)
+                continue
+            }
+
+            if values?.isDirectory == true {
+                // Do not recurse into packages/bundles that aren't handled as apps above.
+                if values?.isPackage == true { continue }
+                walk(logical: logicalChild, physical: child, stack: nextStack)
+            }
+        }
+    }
+
     for dir in dirs {
         let root = URL(
             fileURLWithPath: (dir as NSString).expandingTildeInPath,
             isDirectory: true
         )
-        // Do not use skipsHiddenFiles: symlinks to system apps (e.g. Safari.app) are
-        // often marked hidden and would be skipped. skipsPackageDescendants still
-        // prevents descending into .app bundles.
-        guard
-            let enumerator = fileManager.enumerator(
-                at: root,
-                includingPropertiesForKeys: [.isHiddenKey],
-                options: [.skipsPackageDescendants]
-            )
-        else { continue }
-        while let url = enumerator.nextObject() as? URL {
-            let isApp = url.pathExtension.caseInsensitiveCompare("app") == .orderedSame
-            if isApp {
-                // Identity is the path: same display name under different roots are distinct.
-                // Includes directory bundles and symlinks to bundles (symlink URL is kept).
-                let id = url.standardizedFileURL
-                if seen.insert(id).inserted {
-                    let name = id.deletingPathExtension().lastPathComponent
-                    items.append(AppItem(id: id, name: name))
-                }
-                enumerator.skipDescendants()
-                continue
-            }
-            // Skip other hidden files/dirs so we don't walk junk like .Trash.
-            if (try? url.resourceValues(forKeys: [.isHiddenKey]))?.isHidden == true {
-                enumerator.skipDescendants()
-            }
-        }
+        walk(logical: root, physical: root.resolvingSymlinksInPath(), stack: [])
     }
+
     return items.sorted {
         let byName = $0.name.localizedCaseInsensitiveCompare($1.name)
         if byName != .orderedSame { return byName == .orderedAscending }
