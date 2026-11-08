@@ -175,3 +175,41 @@ private func app(_ name: String) -> AppItem {
     #expect(!items.contains { $0.name == "Contained" })
     #expect(!items.contains { $0.id.standardizedFileURL.path == nestedApp.standardizedFileURL.path })
 }
+
+@Test func scanAppsDetectsSymlinkCycles() throws {
+    let fm = FileManager.default
+    let root = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? fm.removeItem(at: root) }
+
+    let applications = root.appendingPathComponent("Applications", isDirectory: true)
+    let other = root.appendingPathComponent("Other", isDirectory: true)
+    let app = applications.appendingPathComponent("Foo.app", isDirectory: true)
+    let toOther = applications.appendingPathComponent("toOther")
+    let back = other.appendingPathComponent("back")
+
+    try fm.createDirectory(at: app, withIntermediateDirectories: true)
+    try fm.createDirectory(at: other, withIntermediateDirectories: true)
+    try fm.createSymbolicLink(at: toOther, withDestinationURL: other)
+    try fm.createSymbolicLink(at: back, withDestinationURL: applications)
+
+    // Must terminate despite Applications ↔ Other symlink cycle.
+    let items = scanApps(in: [applications.path], fileManager: fm)
+
+    #expect(items.contains { $0.name == "Foo" })
+    #expect(items.count == 1)
+}
+
+@Test func matchingCommandsRequiresSlashPrefix() {
+    #expect(matchingCommands(for: "").isEmpty)
+    #expect(matchingCommands(for: "update").isEmpty)
+    #expect(matchingCommands(for: "/") == LauncherCommand.allCases)
+}
+
+@Test func matchingCommandsFiltersByPrefix() {
+    #expect(matchingCommands(for: "/u") == [.update])
+    #expect(matchingCommands(for: "/up") == [.update])
+    #expect(matchingCommands(for: "/q") == [.quit])
+    #expect(matchingCommands(for: "/UPDATE") == [.update])
+    #expect(matchingCommands(for: "/quit") == [.quit])
+    #expect(matchingCommands(for: "/xyz").isEmpty)
+}

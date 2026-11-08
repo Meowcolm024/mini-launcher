@@ -29,6 +29,11 @@ private func isAppPath(_ url: URL) -> Bool {
     url.pathExtension.caseInsensitiveCompare("app") == .orderedSame
 }
 
+/// Canonical filesystem path for cycle detection (/var vs /private/var, symlink targets).
+private func canonicalPath(_ url: URL) -> String {
+    url.resolvingSymlinksInPath().standardizedFileURL.path
+}
+
 func scanApps(in dirs: [String], fileManager: FileManager = .default) -> [AppItem] {
     var seenApps = Set<URL>()
     var items: [AppItem] = []
@@ -43,9 +48,9 @@ func scanApps(in dirs: [String], fileManager: FileManager = .default) -> [AppIte
     }
 
     /// `logical` is the path shown/launched; `physical` is where we list (symlinks resolved).
-    /// `stack` tracks physical dirs on the current walk to break symlink cycles.
-    func walk(logical: URL, physical: URL, stack: Set<URL>) {
-        let dirKey = physical.standardizedFileURL
+    /// `stack` holds canonical physical paths on the current walk to break symlink cycles.
+    func walk(logical: URL, physical: URL, stack: Set<String>) {
+        let dirKey = canonicalPath(physical)
         guard !stack.contains(dirKey) else { return }
         var nextStack = stack
         nextStack.insert(dirKey)
@@ -75,13 +80,15 @@ func scanApps(in dirs: [String], fileManager: FileManager = .default) -> [AppIte
             if values?.isHidden == true { continue }
 
             if values?.isSymbolicLink == true {
-                let resolved = child.resolvingSymlinksInPath().standardizedFileURL
+                let resolved = child.resolvingSymlinksInPath()
                 var isDir: ObjCBool = false
                 guard fileManager.fileExists(atPath: resolved.path, isDirectory: &isDir),
                     isDir.boolValue
                 else { continue }
                 // Follow directory symlinks only when the target is not an app bundle.
                 if isAppPath(resolved) { continue }
+                // Cycle: symlink target is already on the walk stack.
+                if nextStack.contains(canonicalPath(resolved)) { continue }
                 walk(logical: logicalChild, physical: resolved, stack: nextStack)
                 continue
             }
@@ -158,4 +165,32 @@ func rankedResults(
         }
         .prefix(limit)
         .map(\.0)
+}
+
+// MARK: - Slash commands
+
+enum LauncherCommand: String, CaseIterable, Identifiable {
+    case update
+    case quit
+
+    var id: String { rawValue }
+
+    var token: String { "/\(rawValue)" }
+
+    var summary: String {
+        switch self {
+        case .update: "Reindex apps"
+        case .quit: "Quit launcher"
+        }
+    }
+}
+
+/// Prefix-match slash commands when `query` starts with `/`.
+func matchingCommands(for query: String) -> [LauncherCommand] {
+    guard query.hasPrefix("/") else { return [] }
+    let needle = query.dropFirst().lowercased()
+    if needle.isEmpty { return Array(LauncherCommand.allCases) }
+    return LauncherCommand.allCases.filter { command in
+        command.rawValue.hasPrefix(needle)
+    }
 }
