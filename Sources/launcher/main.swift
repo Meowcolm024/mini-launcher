@@ -73,28 +73,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        // Fresh view each time resets query/selection/focus; apps stay cached from launch /update.
+        // Fresh view each time resets query/selection/focus; apps stay cached from launch /refresh.
         panel.contentView = NSHostingView(
             rootView: LauncherView(
                 apps: apps,
                 state: state,
                 onClose: { [weak self] in
-                    guard let self else { return }
-                    Task { @MainActor in
-                        self.panel.orderOut(nil)
-                    }
+                    self?.panel.orderOut(nil)
                 },
                 onReindex: { [weak self] in
                     guard let self else { return [] }
-                    return MainActor.assumeIsolated {
-                        self.apps = scanApps(in: self.config.lookupPaths)
-                        return self.apps
-                    }
+                    self.apps = scanApps(in: self.config.lookupPaths)
+                    return self.apps
                 },
                 onQuit: {
-                    Task { @MainActor in
-                        NSApp.terminate(nil)
-                    }
+                    NSApp.terminate(nil)
                 }
             )
         )

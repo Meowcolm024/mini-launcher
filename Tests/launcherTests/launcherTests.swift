@@ -6,7 +6,74 @@ private func app(_ name: String) -> AppItem {
     AppItem(id: URL(fileURLWithPath: "/Applications/\(name).app"), name: name)
 }
 
-@Test func emptyQueryIsAlphabeticalWithoutSearchHistory() {
+@Test @MainActor func launchHandlesPendingFailureAndSuccess() throws {
+    let fm = FileManager.default
+    let bundle = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".app")
+    try fm.createDirectory(at: bundle, withIntermediateDirectories: true)
+    defer { try? fm.removeItem(at: bundle) }
+    let item = AppItem(id: bundle, name: "Example")
+    let runtime = RuntimeState()
+    var completion: LaunchState.Completion?
+    var requests = 0
+    var closes = 0
+    let launch = LaunchState { _, callback in
+        requests += 1
+        completion = callback
+    }
+
+    launch.launch(item, state: runtime) { closes += 1 }
+    launch.launch(item, state: runtime) { closes += 1 }
+    #expect(requests == 1)
+    #expect(launch.pendingApp == item)
+    #expect(runtime.searchBoost(for: item.id) == 0)
+    #expect(closes == 0)
+
+    completion?("Permission denied")
+    #expect(launch.pendingApp == nil)
+    #expect(launch.errorMessage?.contains("Example") == true)
+    #expect(launch.errorMessage?.contains("Permission denied") == true)
+    #expect(runtime.searchBoost(for: item.id) == 0)
+    #expect(closes == 0)
+
+    launch.launch(item, state: runtime) { closes += 1 }
+    #expect(launch.errorMessage == nil)
+    completion?(nil)
+    #expect(launch.pendingApp == nil)
+    #expect(runtime.searchBoost(for: item.id) == 10)
+    #expect(closes == 1)
+}
+
+@Test @MainActor func launchSuggestsRefreshForMissingBundle() throws {
+    let fm = FileManager.default
+    let bundle = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".app")
+    defer { try? fm.removeItem(at: bundle) }
+    let item = AppItem(id: bundle, name: "Missing")
+    let runtime = RuntimeState()
+    var completion: LaunchState.Completion?
+    var requests = 0
+    var closes = 0
+    let launch = LaunchState { _, callback in
+        requests += 1
+        completion = callback
+    }
+
+    launch.launch(item, state: runtime) { closes += 1 }
+    #expect(requests == 0)
+    #expect(launch.errorMessage?.contains("/refresh") == true)
+    #expect(launch.pendingApp == nil)
+
+    // Also handle an app disappearing after the launch request starts.
+    try fm.createDirectory(at: bundle, withIntermediateDirectories: true)
+    launch.launch(item, state: runtime) { closes += 1 }
+    try fm.removeItem(at: bundle)
+    completion?("Launch failed")
+    #expect(launch.errorMessage?.contains("/refresh") == true)
+    #expect(launch.pendingApp == nil)
+    #expect(runtime.searchBoost(for: item.id) == 0)
+    #expect(closes == 0)
+}
+
+@Test @MainActor func emptyQueryIsAlphabeticalWithoutSearchHistory() {
     let alpha = app("Alpha")
     let beta = app("Beta")
     let state = RuntimeState()
@@ -16,7 +83,7 @@ private func app(_ name: String) -> AppItem {
     #expect(results == [alpha, beta])
 }
 
-@Test func searchedItemsRankHigherInDefaultView() {
+@Test @MainActor func searchedItemsRankHigherInDefaultView() {
     let alpha = app("Alpha")
     let beta = app("Beta")
     let gamma = app("Gamma")
@@ -29,7 +96,7 @@ private func app(_ name: String) -> AppItem {
     #expect(results == [gamma, alpha, beta])
 }
 
-@Test func searchedItemsBoostFuzzyRanking() {
+@Test @MainActor func searchedItemsBoostFuzzyRanking() {
     let calculator = app("Calculator")
     let calendar = app("Calendar")
     let state = RuntimeState()
@@ -46,7 +113,7 @@ private func app(_ name: String) -> AppItem {
     #expect(results.first == calendar)
 }
 
-@Test func moreSearchesIncreaseBoost() {
+@Test @MainActor func moreSearchesIncreaseBoost() {
     let alpha = app("Alpha")
     let beta = app("Beta")
     let state = RuntimeState()
@@ -59,7 +126,7 @@ private func app(_ name: String) -> AppItem {
     #expect(results == [beta, alpha])
 }
 
-@Test func rankedResultsRespectsLimit() {
+@Test @MainActor func rankedResultsRespectsLimit() {
     let apps = (0..<20).map { app(String(format: "App%02d", $0)) }
     let state = RuntimeState()
 
@@ -176,6 +243,32 @@ private func app(_ name: String) -> AppItem {
     #expect(!items.contains { $0.id.standardizedFileURL.path == nestedApp.standardizedFileURL.path })
 }
 
+@Test func scanAppsSkipsAppFilesAndInvalidSymlinks() throws {
+    let fm = FileManager.default
+    let root = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? fm.removeItem(at: root) }
+
+    try fm.createDirectory(at: root, withIntermediateDirectories: true)
+    let validApp = root.appendingPathComponent("Valid.APP", isDirectory: true)
+    try fm.createDirectory(at: validApp, withIntermediateDirectories: true)
+    let file = root.appendingPathComponent("File.app")
+    try Data().write(to: file)
+    try fm.createSymbolicLink(
+        at: root.appendingPathComponent("FileLink.app"), withDestinationURL: file
+    )
+    try fm.createSymbolicLink(
+        at: root.appendingPathComponent("Broken.app"),
+        withDestinationURL: root.appendingPathComponent("Missing.app")
+    )
+    try fm.createSymbolicLink(
+        at: root.appendingPathComponent("ValidLink.app"), withDestinationURL: validApp
+    )
+
+    let items = scanApps(in: [root.path], fileManager: fm)
+
+    #expect(items.map(\.name) == ["Valid", "ValidLink"])
+}
+
 @Test func scanAppsDetectsSymlinkCycles() throws {
     let fm = FileManager.default
     let root = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -201,15 +294,17 @@ private func app(_ name: String) -> AppItem {
 
 @Test func matchingCommandsRequiresSlashPrefix() {
     #expect(matchingCommands(for: "").isEmpty)
-    #expect(matchingCommands(for: "update").isEmpty)
+    #expect(matchingCommands(for: "refresh").isEmpty)
     #expect(matchingCommands(for: "/") == LauncherCommand.allCases)
 }
 
 @Test func matchingCommandsFiltersByPrefix() {
-    #expect(matchingCommands(for: "/u") == [.update])
-    #expect(matchingCommands(for: "/up") == [.update])
+    #expect(matchingCommands(for: "/r") == [.refresh])
+    #expect(matchingCommands(for: "/ref") == [.refresh])
     #expect(matchingCommands(for: "/q") == [.quit])
-    #expect(matchingCommands(for: "/UPDATE") == [.update])
+    #expect(matchingCommands(for: "/REFRESH") == [.refresh])
+    #expect(matchingCommands(for: "/refresh") == [.refresh])
+    #expect(matchingCommands(for: "/update").isEmpty)
     #expect(matchingCommands(for: "/quit") == [.quit])
     #expect(matchingCommands(for: "/xyz").isEmpty)
 }

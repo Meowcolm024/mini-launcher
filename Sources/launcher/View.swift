@@ -3,21 +3,22 @@ import SwiftUI
 
 struct LauncherView: View {
     let state: RuntimeState
-    let onClose: @Sendable () -> Void
-    let onReindex: @Sendable () -> [AppItem]
-    let onQuit: @Sendable () -> Void
+    let onClose: @MainActor @Sendable () -> Void
+    let onReindex: @MainActor @Sendable () -> [AppItem]
+    let onQuit: @MainActor @Sendable () -> Void
 
     @State private var apps: [AppItem]
     @State private var query = ""
     @State private var selection = 0
+    @State private var launchState = LaunchState()
     @FocusState private var focused: Bool
 
     init(
         apps: [AppItem],
         state: RuntimeState,
-        onClose: @escaping @Sendable () -> Void,
-        onReindex: @escaping @Sendable () -> [AppItem],
-        onQuit: @escaping @Sendable () -> Void
+        onClose: @escaping @MainActor @Sendable () -> Void,
+        onReindex: @escaping @MainActor @Sendable () -> [AppItem],
+        onQuit: @escaping @MainActor @Sendable () -> Void
     ) {
         self.state = state
         self.onClose = onClose
@@ -49,12 +50,33 @@ struct LauncherView: View {
         VStack(spacing: 0) {
             searchField(commands: commands, items: items)
             resultsView(commands: commands, items: items, duplicates: duplicates)
+            if let app = launchState.pendingApp {
+                Divider()
+                HStack {
+                    ProgressView().controlSize(.small)
+                    Text("Opening \(app.name)…")
+                    Spacer()
+                }
+                .font(.callout)
+                .padding(14)
+            }
+            if let message = launchState.errorMessage {
+                Divider()
+                Text(message)
+                    .font(.callout)
+                    .foregroundStyle(.red)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(14)
+            }
         }
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
         .overlay(RoundedRectangle(cornerRadius: 12).stroke(.white.opacity(0.1)))
         .frame(width: 600)
         .frame(maxHeight: .infinity, alignment: .top)
-        .onChange(of: query) { selection = 0 }
+        .onChange(of: query) {
+            selection = 0
+            launchState.clearError()
+        }
         .onAppear { DispatchQueue.main.async { focused = true } }
     }
 
@@ -152,8 +174,10 @@ struct LauncherView: View {
     }
 
     private func run(_ command: LauncherCommand) {
+        guard launchState.pendingApp == nil else { return }
+        launchState.clearError()
         switch command {
-        case .update:
+        case .refresh:
             apps = onReindex()
             query = ""
             selection = 0
@@ -165,11 +189,6 @@ struct LauncherView: View {
     private func launch(_ items: [AppItem]) {
         guard items.indices.contains(selection) else { return }
         let app = items[selection]
-        state.recordSearch(of: app.id)
-        NSWorkspace.shared.openApplication(
-            at: app.id,
-            configuration: NSWorkspace.OpenConfiguration()
-        )
-        onClose()
+        launchState.launch(app, state: state) { onClose() }
     }
 }

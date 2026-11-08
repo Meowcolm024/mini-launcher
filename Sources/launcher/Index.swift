@@ -70,8 +70,13 @@ func scanApps(in dirs: [String], fileManager: FileManager = .default) -> [AppIte
             let logicalChild = logical.appendingPathComponent(child.lastPathComponent)
             let values = try? child.resourceValues(forKeys: keys)
 
-            // Index .app bundles and symlinks named *.app; never descend into them.
+            // Only index .app directories (including symlinks to existing directories).
+            // Never descend into app bundles, even when an entry cannot be indexed.
             if isAppPath(logicalChild) || isAppPath(child) {
+                var isDir: ObjCBool = false
+                guard fileManager.fileExists(atPath: child.path, isDirectory: &isDir),
+                    isDir.boolValue
+                else { continue }
                 record(logicalChild)
                 continue
             }
@@ -135,6 +140,7 @@ func score(_ query: String, _ name: String) -> Int? {
 }
 
 /// Session-scoped counts of apps the user has searched/launched.
+@MainActor
 final class RuntimeState {
     private(set) var searchHits: [URL: Int] = [:]
 
@@ -148,6 +154,7 @@ final class RuntimeState {
 }
 
 /// Rank apps by fuzzy score plus runtime search boost; higher is better.
+@MainActor
 func rankedResults(
     apps: [AppItem],
     query: String,
@@ -170,7 +177,7 @@ func rankedResults(
 // MARK: - Slash commands
 
 enum LauncherCommand: String, CaseIterable, Identifiable {
-    case update
+    case refresh
     case quit
 
     var id: String { rawValue }
@@ -179,7 +186,7 @@ enum LauncherCommand: String, CaseIterable, Identifiable {
 
     var summary: String {
         switch self {
-        case .update: "Reindex apps"
+        case .refresh: "Reindex apps"
         case .quit: "Quit launcher"
         }
     }
