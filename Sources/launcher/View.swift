@@ -2,29 +2,28 @@ import AppKit
 import SwiftUI
 
 struct LauncherView: View {
+    let catalog: AppCatalog
     let state: RuntimeState
+    let launchState: LaunchState
     let onClose: @MainActor @Sendable () -> Void
-    let onReindex: @MainActor @Sendable () -> [AppItem]
     let onQuit: @MainActor @Sendable () -> Void
 
-    @State private var apps: [AppItem]
     @State private var query = ""
     @State private var selection = 0
-    @State private var launchState = LaunchState()
     @FocusState private var focused: Bool
 
     init(
-        apps: [AppItem],
+        catalog: AppCatalog,
         state: RuntimeState,
+        launchState: LaunchState,
         onClose: @escaping @MainActor @Sendable () -> Void,
-        onReindex: @escaping @MainActor @Sendable () -> [AppItem],
         onQuit: @escaping @MainActor @Sendable () -> Void
     ) {
+        self.catalog = catalog
         self.state = state
+        self.launchState = launchState
         self.onClose = onClose
-        self.onReindex = onReindex
         self.onQuit = onQuit
-        _apps = State(initialValue: apps)
     }
 
     private var isCommandMode: Bool {
@@ -32,7 +31,7 @@ struct LauncherView: View {
     }
 
     private var appResults: [AppItem] {
-        rankedResults(apps: apps, query: query, state: state)
+        rankedResults(apps: catalog.apps, query: query, state: state)
     }
 
     private var commandResults: [LauncherCommand] {
@@ -40,7 +39,7 @@ struct LauncherView: View {
     }
 
     private var ambiguousNames: Set<String> {
-        duplicateAppNames(in: apps)
+        duplicateAppNames(in: catalog.apps)
     }
 
     var body: some View {
@@ -48,7 +47,14 @@ struct LauncherView: View {
         let items = appResults
         let duplicates = ambiguousNames
         VStack(spacing: 0) {
-            searchField(commands: commands, items: items)
+            HStack(spacing: 0) {
+                searchField(commands: commands, items: items)
+                if catalog.isScanning {
+                    ProgressView("Indexing apps…")
+                        .controlSize(.small)
+                        .padding(.trailing, 14)
+                }
+            }
             resultsView(commands: commands, items: items, duplicates: duplicates)
             if let app = launchState.pendingApp {
                 Divider()
@@ -76,6 +82,9 @@ struct LauncherView: View {
         .onChange(of: query) {
             selection = 0
             launchState.clearError()
+        }
+        .onChange(of: catalog.apps) {
+            if !isCommandMode { selection = 0 }
         }
         .onAppear { DispatchQueue.main.async { focused = true } }
     }
@@ -178,7 +187,7 @@ struct LauncherView: View {
         launchState.clearError()
         switch command {
         case .refresh:
-            apps = onReindex()
+            catalog.refresh()
             query = ""
             selection = 0
         case .quit:

@@ -26,7 +26,9 @@ Type `/` to list commands, then select one and press Return. Command matching ac
 | `/refresh` | Rescan the application folders |
 | `/quit` | Quit Launcher |
 
-The app list is cached at startup. Run `/refresh` after installing, moving, or removing apps. Indexing skips regular files named `.app`, broken symlinks, and symlinks to files, and does not descend into app bundles.
+Launcher scans in the background at startup and caches the app list. Run `/refresh` after installing, moving, or removing apps. Indexing checks that each app bundle has an executable, accepts symlinks to app bundles with or without the `.app` suffix, and scans each physical folder once.
+
+If hotkey setup fails, Launcher reports the error and exits with status 1.
 
 While an app is opening, Launcher shows progress and prevents repeated launch requests. A successful launch closes the panel and boosts that app’s ranking for the session. A failed launch keeps your query and shows the error; missing apps include a reminder to run `/refresh`.
 

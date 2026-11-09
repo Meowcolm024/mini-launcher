@@ -1,4 +1,5 @@
 import Foundation
+import Observation
 
 struct AppItem: Identifiable, Hashable {
     let id: URL
@@ -29,35 +30,36 @@ private func isAppPath(_ url: URL) -> Bool {
     url.pathExtension.caseInsensitiveCompare("app") == .orderedSame
 }
 
-/// Canonical filesystem path for cycle detection (/var vs /private/var, symlink targets).
-private func canonicalPath(_ url: URL) -> String {
-    url.resolvingSymlinksInPath().standardizedFileURL.path
-}
-
 func scanApps(in dirs: [String], fileManager: FileManager = .default) -> [AppItem] {
+    let keys: Set<URLResourceKey> = [
+        .isHiddenKey, .isSymbolicLinkKey, .isDirectoryKey, .isPackageKey,
+    ]
+    var visitedDirectories = Set<String>()
+    var directoryLinks: [(logical: URL, physical: URL)] = []
     var seenApps = Set<URL>()
     var items: [AppItem] = []
 
-    func record(_ logicalURL: URL) {
-        // Path-based file URLs avoid /var vs /private/var inequality from mixed URL sources.
+    func record(_ logicalURL: URL, bundleAt physicalURL: URL) {
+        guard let bundle = Bundle(url: physicalURL),
+            let info = bundle.infoDictionary,
+            // Legacy apps can use a same-name executable without CFBundleExecutable.
+            info["CFBundleExecutable"] is String || info["CFBundlePackageType"] as? String == "APPL",
+            let executable = bundle.executableURL?.resolvingSymlinksInPath(),
+            (try? executable.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true,
+            fileManager.isExecutableFile(atPath: executable.path)
+        else { return }
+
         let id = URL(fileURLWithPath: logicalURL.standardizedFileURL.path)
         guard seenApps.insert(id).inserted else { return }
-        items.append(
-            AppItem(id: id, name: id.deletingPathExtension().lastPathComponent)
-        )
+        let nameURL = isAppPath(id) ? id.deletingPathExtension() : id
+        items.append(AppItem(id: id, name: nameURL.lastPathComponent))
     }
 
-    /// `logical` is the path shown/launched; `physical` is where we list (symlinks resolved).
-    /// `stack` holds canonical physical paths on the current walk to break symlink cycles.
-    func walk(logical: URL, physical: URL, stack: Set<String>) {
-        let dirKey = canonicalPath(physical)
-        guard !stack.contains(dirKey) else { return }
-        var nextStack = stack
-        nextStack.insert(dirKey)
-
-        let keys: Set<URLResourceKey> = [
-            .isHiddenKey, .isSymbolicLinkKey, .isDirectoryKey, .isPackageKey,
-        ]
+    func walk(logical: URL, physical: URL) {
+        guard !isAppPath(physical),
+            visitedDirectories.insert(physical.resolvingSymlinksInPath().standardizedFileURL.path)
+                .inserted
+        else { return }
         guard
             let children = try? fileManager.contentsOfDirectory(
                 at: physical,
@@ -66,42 +68,26 @@ func scanApps(in dirs: [String], fileManager: FileManager = .default) -> [AppIte
             )
         else { return }
 
-        for child in children {
+        for child in children.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
             let logicalChild = logical.appendingPathComponent(child.lastPathComponent)
-            let values = try? child.resourceValues(forKeys: keys)
+            guard let values = try? child.resourceValues(forKeys: keys) else { continue }
+            let isLink = values.isSymbolicLink == true
+            let target = isLink ? child.resolvingSymlinksInPath() : child
 
-            // Only index .app directories (including symlinks to existing directories).
-            // Never descend into app bundles, even when an entry cannot be indexed.
-            if isAppPath(logicalChild) || isAppPath(child) {
-                var isDir: ObjCBool = false
-                guard fileManager.fileExists(atPath: child.path, isDirectory: &isDir),
-                    isDir.boolValue
-                else { continue }
-                record(logicalChild)
+            // Keep the link's name, including links whose names lack a .app suffix.
+            if isAppPath(child) || isAppPath(target) {
+                record(logicalChild, bundleAt: target)
                 continue
             }
 
-            // Symlinks to system apps are often hidden; still skip other hidden entries.
-            if values?.isHidden == true { continue }
-
-            if values?.isSymbolicLink == true {
-                let resolved = child.resolvingSymlinksInPath()
-                var isDir: ObjCBool = false
-                guard fileManager.fileExists(atPath: resolved.path, isDirectory: &isDir),
-                    isDir.boolValue
+            if values.isHidden == true { continue }
+            if isLink {
+                guard let targetValues = try? target.resourceValues(forKeys: keys),
+                    targetValues.isDirectory == true, targetValues.isPackage != true
                 else { continue }
-                // Follow directory symlinks only when the target is not an app bundle.
-                if isAppPath(resolved) { continue }
-                // Cycle: symlink target is already on the walk stack.
-                if nextStack.contains(canonicalPath(resolved)) { continue }
-                walk(logical: logicalChild, physical: resolved, stack: nextStack)
-                continue
-            }
-
-            if values?.isDirectory == true {
-                // Do not recurse into packages/bundles that aren't handled as apps above.
-                if values?.isPackage == true { continue }
-                walk(logical: logicalChild, physical: child, stack: nextStack)
+                directoryLinks.append((logicalChild, target))
+            } else if values.isDirectory == true, values.isPackage != true {
+                walk(logical: logicalChild, physical: target)
             }
         }
     }
@@ -111,13 +97,43 @@ func scanApps(in dirs: [String], fileManager: FileManager = .default) -> [AppIte
             fileURLWithPath: (dir as NSString).expandingTildeInPath,
             isDirectory: true
         )
-        walk(logical: root, physical: root.resolvingSymlinksInPath(), stack: [])
+        walk(logical: root, physical: root.resolvingSymlinksInPath())
+    }
+
+    // Prefer regular directory paths and only walk each physical directory once.
+    while !directoryLinks.isEmpty {
+        let links = directoryLinks
+        directoryLinks.removeAll()
+        for link in links {
+            walk(logical: link.logical, physical: link.physical)
+        }
     }
 
     return items.sorted {
         let byName = $0.name.localizedCaseInsensitiveCompare($1.name)
         if byName != .orderedSame { return byName == .orderedAscending }
         return $0.id.path < $1.id.path
+    }
+}
+
+@MainActor
+@Observable
+final class AppCatalog {
+    private(set) var apps: [AppItem] = []
+    private(set) var isScanning = false
+    private let paths: [String]
+
+    init(paths: [String]) {
+        self.paths = paths
+    }
+
+    func refresh() {
+        guard !isScanning else { return }
+        isScanning = true
+        Task {
+            apps = await Task.detached { [paths] in scanApps(in: paths) }.value
+            isScanning = false
+        }
     }
 }
 

@@ -33,13 +33,13 @@ final class Panel: NSPanel {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let config = Config.current
     let state = RuntimeState()
+    let catalog = AppCatalog(paths: Config.current.lookupPaths)
+    let launchState = LaunchState()
     var panel: Panel!
-    var apps: [AppItem] = []
     var hotKeyRef: EventHotKeyRef?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)  // no Dock icon
-        apps = scanApps(in: config.lookupPaths)
 
         panel = Panel(
             contentRect: NSRect(x: 0, y: 0, width: 600, height: 380),
@@ -60,11 +60,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             object: panel, queue: .main
         ) { [weak self] _ in
             Task { @MainActor in
-                self?.panel.orderOut(nil)
+                guard let self, !self.panel.isKeyWindow else { return }
+                self.panel.orderOut(nil)
             }
         }
 
         registerHotKey()
+        catalog.refresh()
     }
 
     func toggle() {
@@ -73,18 +75,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        // Fresh view each time resets query/selection/focus; apps stay cached from launch /refresh.
+        // Reset panel input while retaining the catalog and any pending launch.
+        launchState.beginPresentation()
         panel.contentView = NSHostingView(
             rootView: LauncherView(
-                apps: apps,
+                catalog: catalog,
                 state: state,
+                launchState: launchState,
                 onClose: { [weak self] in
-                    self?.panel.orderOut(nil)
-                },
-                onReindex: { [weak self] in
-                    guard let self else { return [] }
-                    self.apps = scanApps(in: self.config.lookupPaths)
-                    return self.apps
+                    guard let self, panel.isVisible else { return }
+                    panel.orderOut(nil)
                 },
                 onQuit: {
                     NSApp.terminate(nil)
@@ -108,18 +108,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             eventClass: OSType(kEventClassKeyboard),
             eventKind: UInt32(kEventHotKeyPressed)
         )
-        InstallEventHandler(
+        let handlerStatus = InstallEventHandler(
             GetApplicationEventTarget(),
             { _, _, ctx in
                 let d = Unmanaged<AppDelegate>.fromOpaque(ctx!).takeUnretainedValue()
                 DispatchQueue.main.async { d.toggle() }
                 return noErr
             }, 1, &spec, Unmanaged.passUnretained(self).toOpaque(), nil)
+        guard handlerStatus == noErr else {
+            hotKeySetupFailed("install the hotkey handler", status: handlerStatus)
+        }
 
         let id = EventHotKeyID(signature: OSType(0x4C4E_4348), id: 1)
-        RegisterEventHotKey(
+        let registrationStatus = RegisterEventHotKey(
             config.hotkeyKeyCode, config.hotkeyModifiers, id,
             GetApplicationEventTarget(), 0, &hotKeyRef)
+        guard registrationStatus == noErr else {
+            hotKeySetupFailed("register Option+Space", status: registrationStatus)
+        }
+    }
+
+    private func hotKeySetupFailed(_ action: String, status: OSStatus) -> Never {
+        let message = "Launcher couldn’t \(action) (OSStatus \(status)).\n"
+        FileHandle.standardError.write(Data(message.utf8))
+        exit(1)
     }
 }
 

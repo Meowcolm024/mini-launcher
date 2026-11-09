@@ -6,6 +6,18 @@ private func app(_ name: String) -> AppItem {
     AppItem(id: URL(fileURLWithPath: "/Applications/\(name).app"), name: name)
 }
 
+private func createAppBundle(at url: URL) throws {
+    let contents = url.appendingPathComponent("Contents")
+    let macOS = contents.appendingPathComponent("MacOS")
+    let executable = macOS.appendingPathComponent("fixture")
+    try FileManager.default.createDirectory(at: macOS, withIntermediateDirectories: true)
+    let info = ["CFBundleExecutable": "fixture", "CFBundlePackageType": "APPL"]
+    let plist = try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0)
+    try plist.write(to: contents.appendingPathComponent("Info.plist"))
+    try Data("#!/bin/sh\nexit 0\n".utf8).write(to: executable)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+}
+
 @Test @MainActor func launchHandlesPendingFailureAndSuccess() throws {
     let fm = FileManager.default
     let bundle = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".app")
@@ -41,6 +53,36 @@ private func app(_ name: String) -> AppItem {
     #expect(launch.pendingApp == nil)
     #expect(runtime.searchBoost(for: item.id) == 10)
     #expect(closes == 1)
+}
+
+@Test @MainActor func reopeningPanelKeepsPendingLaunchWithoutClosingNewPresentation() throws {
+    let fm = FileManager.default
+    let bundle = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".app")
+    try fm.createDirectory(at: bundle, withIntermediateDirectories: true)
+    defer { try? fm.removeItem(at: bundle) }
+    let item = AppItem(id: bundle, name: "Example")
+    let runtime = RuntimeState()
+    var completions: [LaunchState.Completion] = []
+    let launch = LaunchState { _, callback in completions.append(callback) }
+    var panelIsVisible = true
+
+    launch.beginPresentation()
+    launch.launch(item, state: runtime) { panelIsVisible = false }
+
+    launch.beginPresentation()
+    #expect(launch.pendingApp == item)
+    launch.launch(item, state: runtime) { panelIsVisible = false }
+    try #require(completions.count == 1)
+
+    completions[0](nil)
+    #expect(panelIsVisible)
+    #expect(launch.pendingApp == nil)
+    #expect(runtime.searchBoost(for: item.id) == 10)
+
+    launch.launch(item, state: runtime) { panelIsVisible = false }
+    try #require(completions.count == 2)
+    completions[1](nil)
+    #expect(!panelIsVisible)
 }
 
 @Test @MainActor func launchSuggestsRefreshForMissingBundle() throws {
@@ -152,10 +194,10 @@ private func app(_ name: String) -> AppItem {
     let nestedBar = utilities.appendingPathComponent("Bar.app", isDirectory: true)
     let nestedInsideBundle = systemFoo.appendingPathComponent("Contained.app", isDirectory: true)
 
-    try fm.createDirectory(at: systemFoo, withIntermediateDirectories: true)
-    try fm.createDirectory(at: homeFoo, withIntermediateDirectories: true)
-    try fm.createDirectory(at: nestedBar, withIntermediateDirectories: true)
-    try fm.createDirectory(at: nestedInsideBundle, withIntermediateDirectories: true)
+    try createAppBundle(at: systemFoo)
+    try createAppBundle(at: homeFoo)
+    try createAppBundle(at: nestedBar)
+    try createAppBundle(at: nestedInsideBundle)
 
     let items = scanApps(in: [applications.path, homeApplications.path], fileManager: fm)
 
@@ -194,12 +236,14 @@ private func app(_ name: String) -> AppItem {
     let applications = root.appendingPathComponent("Applications", isDirectory: true)
     let realApp = root.appendingPathComponent("RealSafari.app", isDirectory: true)
     let link = applications.appendingPathComponent("Safari.app")
+    let extensionlessLink = applications.appendingPathComponent("Browser")
     let nestedInsideReal = realApp.appendingPathComponent("Contained.app", isDirectory: true)
 
     try fm.createDirectory(at: applications, withIntermediateDirectories: true)
-    try fm.createDirectory(at: realApp, withIntermediateDirectories: true)
-    try fm.createDirectory(at: nestedInsideReal, withIntermediateDirectories: true)
+    try createAppBundle(at: realApp)
+    try createAppBundle(at: nestedInsideReal)
     try fm.createSymbolicLink(at: link, withDestinationURL: realApp)
+    try fm.createSymbolicLink(at: extensionlessLink, withDestinationURL: realApp)
 
     // Match system apps like /Applications/Safari.app, which are hidden symlinks.
     var mutableLink = link
@@ -211,6 +255,9 @@ private func app(_ name: String) -> AppItem {
 
     #expect(items.contains { $0.name == "Safari" })
     #expect(items.contains { $0.id.standardizedFileURL.path == link.standardizedFileURL.path })
+    #expect(items.contains {
+        $0.name == "Browser" && $0.id.path == extensionlessLink.path
+    })
     #expect(!items.contains { $0.name == "Contained" })
     #expect(!items.contains { $0.id.standardizedFileURL.path == realApp.standardizedFileURL.path })
 }
@@ -229,28 +276,41 @@ private func app(_ name: String) -> AppItem {
     let appLink = applications.appendingPathComponent("Bar.app")
 
     try fm.createDirectory(at: applications, withIntermediateDirectories: true)
-    try fm.createDirectory(at: nestedInsideApp, withIntermediateDirectories: true)
-    try fm.createDirectory(at: appLinkTarget, withIntermediateDirectories: true)
+    try createAppBundle(at: nestedApp)
+    try createAppBundle(at: nestedInsideApp)
+    try createAppBundle(at: appLinkTarget)
     try fm.createSymbolicLink(at: dirLink, withDestinationURL: realDir)
+    try fm.createSymbolicLink(
+        at: applications.appendingPathComponent("ExtraCopy"), withDestinationURL: realDir
+    )
     try fm.createSymbolicLink(at: appLink, withDestinationURL: appLinkTarget)
 
     let items = scanApps(in: [applications.path], fileManager: fm)
     let logicalFoo = dirLink.appendingPathComponent("Foo.app").standardizedFileURL
 
+    #expect(items.count == 2)
     #expect(items.contains { $0.id.standardizedFileURL.path == logicalFoo.path })
     #expect(items.contains { $0.id.standardizedFileURL.path == appLink.standardizedFileURL.path })
     #expect(!items.contains { $0.name == "Contained" })
     #expect(!items.contains { $0.id.standardizedFileURL.path == nestedApp.standardizedFileURL.path })
+
+    let includingRealDir = scanApps(in: [applications.path, realDir.path], fileManager: fm)
+    #expect(includingRealDir.filter { $0.name == "Foo" }.map(\.id.path) == [nestedApp.path])
 }
 
-@Test func scanAppsSkipsAppFilesAndInvalidSymlinks() throws {
+@Test func scanAppsSkipsInvalidAppBundlesAndSymlinks() throws {
     let fm = FileManager.default
     let root = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
     defer { try? fm.removeItem(at: root) }
 
     try fm.createDirectory(at: root, withIntermediateDirectories: true)
     let validApp = root.appendingPathComponent("Valid.APP", isDirectory: true)
-    try fm.createDirectory(at: validApp, withIntermediateDirectories: true)
+    try createAppBundle(at: validApp)
+    let ordinaryFolder = root.appendingPathComponent("Folder.app", isDirectory: true)
+    try fm.createDirectory(at: ordinaryFolder, withIntermediateDirectories: true)
+    let missingExecutable = root.appendingPathComponent("MissingExecutable.app", isDirectory: true)
+    try createAppBundle(at: missingExecutable)
+    try fm.removeItem(at: missingExecutable.appendingPathComponent("Contents/MacOS/fixture"))
     let file = root.appendingPathComponent("File.app")
     try Data().write(to: file)
     try fm.createSymbolicLink(
@@ -263,10 +323,32 @@ private func app(_ name: String) -> AppItem {
     try fm.createSymbolicLink(
         at: root.appendingPathComponent("ValidLink.app"), withDestinationURL: validApp
     )
+    try fm.createSymbolicLink(
+        at: root.appendingPathComponent("FolderLink.app"), withDestinationURL: ordinaryFolder
+    )
 
     let items = scanApps(in: [root.path], fileManager: fm)
 
     #expect(items.map(\.name) == ["Valid", "ValidLink"])
+}
+
+@Test func scanAppsAcceptsLegacyAppWithSameNameExecutable() throws {
+    let fm = FileManager.default
+    let root = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? fm.removeItem(at: root) }
+
+    let legacy = root.appendingPathComponent("Legacy.app", isDirectory: true)
+    try createAppBundle(at: legacy)
+    let info = try PropertyListSerialization.data(
+        fromPropertyList: ["CFBundlePackageType": "APPL"], format: .xml, options: 0
+    )
+    try info.write(to: legacy.appendingPathComponent("Contents/Info.plist"))
+    try fm.moveItem(
+        at: legacy.appendingPathComponent("Contents/MacOS/fixture"),
+        to: legacy.appendingPathComponent("Legacy")
+    )
+
+    #expect(scanApps(in: [root.path]).map(\.name) == ["Legacy"])
 }
 
 @Test func scanAppsDetectsSymlinkCycles() throws {
@@ -280,7 +362,7 @@ private func app(_ name: String) -> AppItem {
     let toOther = applications.appendingPathComponent("toOther")
     let back = other.appendingPathComponent("back")
 
-    try fm.createDirectory(at: app, withIntermediateDirectories: true)
+    try createAppBundle(at: app)
     try fm.createDirectory(at: other, withIntermediateDirectories: true)
     try fm.createSymbolicLink(at: toOther, withDestinationURL: other)
     try fm.createSymbolicLink(at: back, withDestinationURL: applications)

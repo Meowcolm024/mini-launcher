@@ -10,6 +10,7 @@ final class LaunchState {
     private(set) var pendingApp: AppItem?
     private(set) var errorMessage: String?
 
+    @ObservationIgnored private var presentationID = UUID()
     private let fileManager: FileManager
     private let openApplication: OpenApplication
 
@@ -17,7 +18,7 @@ final class LaunchState {
         fileManager: FileManager = .default,
         openApplication: @escaping OpenApplication = { url, completion in
             NSWorkspace.shared.openApplication(
-                at: url, configuration: NSWorkspace.OpenConfiguration()
+                at: url.resolvingSymlinksInPath(), configuration: NSWorkspace.OpenConfiguration()
             ) { application, error in
                 let message = error?.localizedDescription
                     ?? (application == nil ? "macOS did not return a running application." : nil)
@@ -33,7 +34,12 @@ final class LaunchState {
         errorMessage = nil
     }
 
-    func launch(_ app: AppItem, state: RuntimeState, onSuccess: @escaping @MainActor () -> Void) {
+    func beginPresentation() {
+        presentationID = UUID()
+        clearError()
+    }
+
+    func launch(_ app: AppItem, state: RuntimeState, closeOnSuccess: @escaping @MainActor () -> Void) {
         guard pendingApp == nil else { return }
         errorMessage = nil
         guard bundleExists(at: app.id) else {
@@ -41,6 +47,7 @@ final class LaunchState {
             return
         }
 
+        let launchPresentationID = presentationID
         pendingApp = app
         openApplication(app.id) { [self] error in
             // Ignore a duplicate completion from a launch provider.
@@ -54,7 +61,9 @@ final class LaunchState {
                 }
             } else {
                 state.recordSearch(of: app.id)
-                onSuccess()
+                if presentationID == launchPresentationID {
+                    closeOnSuccess()
+                }
             }
         }
     }
