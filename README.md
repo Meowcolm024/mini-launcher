@@ -10,6 +10,8 @@ Requires macOS 14+ and Swift 6.4+.
 swift run
 ```
 
+Run `make app` to build a locally signed `Launcher.app` in the project directory. In Finder, drag it to your Applications folder, then double-click it there to start Launcher.
+
 | Action | Shortcut |
 | --- | --- |
 | Show / hide | Option+Space |
